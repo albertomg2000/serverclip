@@ -1,111 +1,77 @@
-import os
-import io
-from typing import Optional
-
 import torch
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from torchvision import transforms
+import open_clip
 from PIL import Image
-
-# Lazy imports (se importan al cargar el modelo)
-open_clip = None
-
-app = FastAPI()
+import io
+from typing import Optional
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Estado global (caché en memoria)
-_state = {
-    "clip_model": None,
-    "transform": None,
-    "model_embeddings": None,
-    "model_labels": None,
-    "version_embeddings": None,
-    "version_labels": None,
-}
+# Cargar modelo CLIP
+clip_model, _, preprocess = open_clip.create_model_and_transforms(
+    'ViT-H-14', pretrained='laion2b_s32b_b79k'
+)
+clip_model = clip_model.to(DEVICE)
+clip_model.eval()
+for param in clip_model.parameters():
+    param.requires_grad = False
 
-def _load_runtime():
-    """Carga el modelo y los embeddings solo una vez (primer request)."""
-    global open_clip
-    if _state["clip_model"] is not None:
-        return
+# Cargar embeddings de modelos (marca + modelo)
+model_ckpt = torch.load("text_embeddings_modelos_h14.pt", map_location=DEVICE)
+model_labels = model_ckpt["labels"]
+model_embeddings = model_ckpt["embeddings"].to(DEVICE)
+model_embeddings /= model_embeddings.norm(dim=-1, keepdim=True)
 
-    # Import aquí para que no gaste RAM hasta que haga falta
-    import open_clip as _open_clip
-    from torchvision import transforms as T
-    open_clip = _open_clip
+# Cargar embeddings de versiones (marca + modelo + versión)
+version_ckpt = torch.load("text_embeddings_h14.pt", map_location=DEVICE)
+version_labels = version_ckpt["labels"]
+version_embeddings = version_ckpt["embeddings"].to(DEVICE)
+version_embeddings /= version_embeddings.norm(dim=-1, keepdim=True)
 
-    # Modelo pequeño para Render / RAM baja
-    vit_name = os.environ.get("CLIP_VIT", "ViT-B-32")
-    pretrained = os.environ.get("CLIP_PRETRAINED", "openai")
+# Transformación de imagen
+normalize = next(t for t in preprocess.transforms if isinstance(t, transforms.Normalize))
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=normalize.mean, std=normalize.std),
+])
 
-    clip_model, _, preprocess = open_clip.create_model_and_transforms(
-        vit_name, pretrained=pretrained
-    )
-    clip_model = clip_model.to(DEVICE)
-    clip_model.eval()
-    for p in clip_model.parameters():
-        p.requires_grad = False
+app = FastAPI()
 
-    # Embeddings
-    model_ckpt = torch.load("text_embeddings_modelos_h14.pt", map_location=DEVICE)
-    version_ckpt = torch.load("text_embeddings_h14.pt", map_location=DEVICE)
-
-    model_emb = model_ckpt["embeddings"].to(DEVICE)
-    model_emb = model_emb / model_emb.norm(dim=-1, keepdim=True)
-    version_emb = version_ckpt["embeddings"].to(DEVICE)
-    version_emb = version_emb / version_emb.norm(dim=-1, keepdim=True)
-
-    # Transform
-    normalize = next(t for t in preprocess.transforms if isinstance(t, T.Normalize))
-    transform = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize(mean=normalize.mean, std=normalize.std),
-    ])
-
-    _state.update({
-        "clip_model": clip_model,
-        "transform": transform,
-        "model_embeddings": model_emb,
-        "model_labels": model_ckpt["labels"],
-        "version_embeddings": version_emb,
-        "version_labels": version_ckpt["labels"],
-    })
-
-def _predict_top(text_feats, text_labels, image_tensor, topk=3):
+def predict_top(text_feats, text_labels, image_tensor, topk=3):
     with torch.no_grad():
-        image_features = _state["clip_model"].encode_image(image_tensor)
+        image_features = clip_model.encode_image(image_tensor)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         similarity = (100.0 * image_features @ text_feats.T).softmax(dim=-1)
         topk_result = torch.topk(similarity[0], k=topk)
     return [
-        {"label": text_labels[idx], "confidence": round(conf.item() * 100, 2)}
+        {
+            "label": text_labels[idx],
+            "confidence": round(conf.item() * 100, 2)
+        }
         for conf, idx in zip(topk_result.values, topk_result.indices)
     ]
 
-def _process_image(image_bytes: bytes):
-    _load_runtime()
+def process_image(image_bytes: bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_tensor = _state["transform"](img).unsqueeze(0).to(DEVICE)
+    img_tensor = transform(img).unsqueeze(0).to(DEVICE)
 
-    # Paso 1: modelo
-    top_model = _predict_top(_state["model_embeddings"], _state["model_labels"], img_tensor, topk=1)[0]
+    # Paso 1: predecir modelo
+    top_model = predict_top(model_embeddings, model_labels, img_tensor, topk=1)[0]
     modelo_predecido = top_model["label"]
     confianza_modelo = top_model["confidence"]
 
-    # Marca + modelo
-    try:
-        marca, modelo = modelo_predecido.split(" ", 1)
-    except ValueError:
-        marca, modelo = "", modelo_predecido
+    # Separar marca y modelo
+    marca, modelo = modelo_predecido.split(" ", 1)
 
-    # Filtrar versiones que empiecen por el label completo del modelo
+    # Paso 2: buscar versiones que empiecen con ese modelo completo
     versiones_filtradas = [
-        (label, idx) for idx, label in enumerate(_state["version_labels"])
+        (label, idx) for idx, label in enumerate(version_labels)
         if label.startswith(modelo_predecido)
     ]
+
     if not versiones_filtradas:
         return {
             "marca": marca,
@@ -114,16 +80,17 @@ def _process_image(image_bytes: bytes):
             "version": "No se encontraron versiones para este modelo"
         }
 
+    # Extraer embeddings correspondientes
     indices_versiones = [idx for _, idx in versiones_filtradas]
     versiones_labels = [label for label, _ in versiones_filtradas]
-    versiones_embeds = _state["version_embeddings"][indices_versiones]
+    versiones_embeds = version_embeddings[indices_versiones]
 
-    # Paso 3: versión
-    top_version = _predict_top(versiones_embeds, versiones_labels, img_tensor, topk=1)[0]
+    # Paso 3: predecir versión dentro de las versiones del modelo
+    top_version = predict_top(versiones_embeds, versiones_labels, img_tensor, topk=1)[0]
     version_predicha = (
-        top_version["label"].replace(modelo_predecido + " ", "")
-        if top_version["confidence"] >= 25 else
-        "Versión no identificada con suficiente confianza"
+        top_version["label"].replace(modelo_predecido + " ", "") 
+        if top_version["confidence"] >= 25
+        else "Versión no identificada con suficiente confianza"
     )
 
     return {
@@ -134,11 +101,13 @@ def _process_image(image_bytes: bytes):
         "confianza_version": top_version["confidence"]
     }
 
+
 @app.post("/predict/")
 async def predict(front: UploadFile = File(...), back: Optional[UploadFile] = File(None)):
     front_bytes = await front.read()
     if back:
-        _ = await back.read()  # (reservado para futuro)
-    result = _process_image(front_bytes)
+        _ = await back.read()
+    result = process_image(front_bytes)
     return JSONResponse(content=result)
+
 
