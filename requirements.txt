@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+torch
+torchvision
+pillow
+open_clip_torch
+timm
