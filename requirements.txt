@@ -1,7 +1,12 @@
-fastapi
-uvicorn[standard]
-torch
-torchvision
+# PyTorch CPU wheels (sin CUDA)
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Resto
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
 pillow
 open_clip_torch
 timm
+huggingface-hub
